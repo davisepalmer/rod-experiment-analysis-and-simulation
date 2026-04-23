@@ -1,0 +1,8 @@
+{
+  "pull_distance_in": 0.5,
+  "pull_speed_in_per_s": 1.0,
+  "peak_force_lbf": 362.1043133906307,
+  "peak_force_n": 1610.7202338011914,
+  "anchor_mass_kg": 4.625970470194321,
+  "fully_extracted_at_s": 0.10416666666666667
+}
