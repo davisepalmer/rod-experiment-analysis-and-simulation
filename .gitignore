@@ -3,3 +3,5 @@
 /.Rproj.user
 /data.Rproj
 /presentation
+/scripts/__pycache__
+/scripts/*.ps1
