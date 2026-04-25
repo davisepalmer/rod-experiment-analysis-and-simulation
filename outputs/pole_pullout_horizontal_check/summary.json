@@ -1,0 +1,13 @@
+{
+  "pull_distance_in": 0.5,
+  "pull_speed_in_per_s": 1.0,
+  "object_mass_lb": 25.0,
+  "force_stop_threshold_lbf": 500.0,
+  "pull_height_in": 17.5,
+  "pull_angle_deg": 0.0,
+  "peak_force_lbf": 3.445029160981449,
+  "peak_force_n": 15.324253179060692,
+  "anchor_mass_kg": 11.33980925,
+  "fully_extracted_at_s": null,
+  "particle_count": 215
+}
