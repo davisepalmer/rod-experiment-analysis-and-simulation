@@ -85,30 +85,98 @@ model_data$beam_dimension = factor(model_data$beam_dimension, levels = levels(tr
 
 alpha_level = 0.05
 
-current_eqn = force_lbf ~
-  beam_dimension +
-  soil_moisture_level +
-  displacement_in + I(displacement_in^2) + I(displacement_in^3) +
-  beam_dimension:soil_moisture_level +
-  displacement_in:beam_dimension +
-  I(displacement_in^2):beam_dimension +
-  displacement_in:soil_moisture_level +
-  I(displacement_in^2):soil_moisture_level
+add_regression_columns = function(data) {
+  data$IB = as.integer(data$beam_dimension == "IBeam")
+  data$SQ = as.integer(data$beam_dimension == "Square")
+  data$M = data$soil_moisture_level
+  data$D = data$displacement_in
+  data$D2 = data$D^2
+  data$D3 = data$D^3
+
+  data$IBxM = data$IB * data$M
+  data$SQxM = data$SQ * data$M
+  data$IBxD = data$IB * data$D
+  data$SQxD = data$SQ * data$D
+  data$IBxD2 = data$IB * data$D2
+  data$SQxD2 = data$SQ * data$D2
+  data$MxD = data$M * data$D
+  data$MxD2 = data$M * data$D2
+
+  data
+}
+
+build_eqn = function(term_names) {
+  reformulate(term_names, response = "force_lbf")
+}
+
+format_model_equation = function(model) {
+  coefficients = coef(model)
+  term_names = names(coefficients)
+  term_names[term_names == "(Intercept)"] = "Intercept"
+
+  paste(
+    "force_lbf =",
+    paste(sprintf("%+.8g*%s", coefficients, term_names), collapse = " "),
+    collapse = " "
+  )
+}
+
+format_readable_equation = function(model) {
+  coefficients = coef(model)
+  term_names = names(coefficients)
+  term_names[term_names == "(Intercept)"] = ""
+
+  equation_terms = sprintf("%.8g%s", abs(coefficients), ifelse(term_names == "", "", paste0("*", term_names)))
+  signs = ifelse(coefficients < 0, " - ", " + ")
+  equation = paste0(equation_terms[1], paste0(signs[-1], equation_terms[-1], collapse = ""))
+
+  paste("force_lbf =", equation)
+}
+
+format_wide_copy_paste_table = function(coefficient_table) {
+  term_names = rownames(coefficient_table)
+  term_names[term_names == "(Intercept)"] = "Int"
+
+  value_matrix = rbind(
+    formatC(coefficient_table[, "Estimate"], digits = 8, format = "fg", flag = "#"),
+    format.pval(coefficient_table[, "Pr(>|t|)"], digits = 4, eps = 0.0001)
+  )
+
+  table_data = data.frame(
+    statistic = c("Coefficient", "p-value"),
+    value_matrix,
+    row.names = NULL,
+    check.names = FALSE
+  )
+
+  names(table_data) = c("", term_names)
+  table_data
+}
+
+model_data = add_regression_columns(model_data)
+
+current_terms = c(
+  "IB", "SQ", "M", "D", "D2", "D3",
+  "IBxM", "SQxM", "IBxD", "SQxD", "IBxD2", "SQxD2", "MxD", "MxD2"
+)
 
 removed_terms = character()
 
 repeat {
+  current_eqn = build_eqn(current_terms)
   current_model = lm(current_eqn, data = model_data)
   coefficient_table = summary(current_model)$coefficients
   non_intercept_terms = coefficient_table[rownames(coefficient_table) != "(Intercept)", , drop = FALSE]
+  p_values = non_intercept_terms[, "Pr(>|t|)"]
+  p_values[is.na(p_values)] = Inf
 
-  if (nrow(non_intercept_terms) == 0 || all(non_intercept_terms[, "Pr(>|t|)"] < alpha_level, na.rm = TRUE)) {
+  if (nrow(non_intercept_terms) == 0 || all(p_values < alpha_level)) {
     break
   }
 
-  worst_term = rownames(non_intercept_terms)[which.max(non_intercept_terms[, "Pr(>|t|)"])]
+  worst_term = rownames(non_intercept_terms)[which.max(p_values)]
   removed_terms = c(removed_terms, worst_term)
-  current_eqn = update(current_eqn, paste(". ~ . - `", worst_term, "`", sep = ""))
+  current_terms = setdiff(current_terms, worst_term)
 }
 
 final_model = lm(current_eqn, data = model_data)
@@ -129,3 +197,17 @@ print(final_anova_table)
 
 print("Final reduced equation:")
 print(current_eqn)
+
+print("Final reduced equation with coefficients:")
+print(format_model_equation(final_model))
+
+cat("\nCOPY/PASTE FINAL EQUATION:\n")
+cat(format_readable_equation(final_model), "\n", sep = "")
+
+cat("\nCOPY/PASTE COEFFICIENTS AND P-VALUES:\n")
+write.table(
+  format_wide_copy_paste_table(final_coefficient_table),
+  row.names = FALSE,
+  quote = FALSE,
+  sep = "\t"
+)

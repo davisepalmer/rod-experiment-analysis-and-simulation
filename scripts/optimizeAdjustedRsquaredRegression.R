@@ -86,23 +86,87 @@ model_data$beam_dimension = factor(model_data$beam_dimension, levels = levels(tr
 max_poly_degree = 10
 min_poly_degree = 1
 adjusted_r_squared_tolerance = 0.002
+alpha_level = 0.05
 
-build_eqn = function(poly_degree) {
-  displacement_terms = paste0("I(displacement_in^", seq_len(poly_degree), ")", collapse = " + ")
+add_regression_columns = function(data, poly_degree) {
+  data$IB = as.integer(data$beam_dimension == "IBeam")
+  data$SQ = as.integer(data$beam_dimension == "Square")
+  data$M = data$soil_moisture_level
+  data$D = data$displacement_in
 
-  as.formula(
-    paste(
-      "force_lbf ~ beam_dimension + soil_moisture_level +",
-      displacement_terms,
-      "+ beam_dimension:soil_moisture_level",
-      "+ (", displacement_terms, "):beam_dimension",
-      "+ (", displacement_terms, "):soil_moisture_level"
-    )
+  if (poly_degree >= 2) {
+    for (degree in 2:poly_degree) {
+      data[[paste0("D", degree)]] = data$D^degree
+    }
+  }
+
+  data$IBxM = data$IB * data$M
+  data$SQxM = data$SQ * data$M
+
+  for (degree in seq_len(poly_degree)) {
+    displacement_term = if (degree == 1) "D" else paste0("D", degree)
+    data[[paste0("IBx", displacement_term)]] = data$IB * data[[displacement_term]]
+    data[[paste0("SQx", displacement_term)]] = data$SQ * data[[displacement_term]]
+    data[[paste0("Mx", displacement_term)]] = data$M * data[[displacement_term]]
+  }
+
+  data
+}
+
+build_terms = function(poly_degree) {
+  displacement_terms = c("D", if (poly_degree >= 2) paste0("D", 2:poly_degree) else character())
+
+  c(
+    "IB", "SQ", "M",
+    displacement_terms,
+    "IBxM", "SQxM",
+    paste0("IBx", displacement_terms),
+    paste0("SQx", displacement_terms),
+    paste0("Mx", displacement_terms)
   )
 }
 
+build_eqn = function(term_names) {
+  reformulate(term_names, response = "force_lbf")
+}
+
+reduce_until_all_terms_significant = function(term_names, data, alpha = 0.05) {
+  removed_terms = character()
+
+  repeat {
+    eqn = build_eqn(term_names)
+    model = lm(eqn, data = data)
+    coefficient_table = summary(model)$coefficients
+    non_intercept_terms = coefficient_table[rownames(coefficient_table) != "(Intercept)", , drop = FALSE]
+    p_values = non_intercept_terms[, "Pr(>|t|)"]
+    p_values[is.na(p_values)] = Inf
+
+    if (nrow(non_intercept_terms) == 0 || all(p_values < alpha)) {
+      return(list(model = model, eqn = eqn, terms = term_names, removed_terms = removed_terms))
+    }
+
+    worst_term = rownames(non_intercept_terms)[which.max(p_values)]
+    removed_terms = c(removed_terms, worst_term)
+    term_names = setdiff(term_names, worst_term)
+  }
+}
+
+format_model_equation = function(model) {
+  coefficients = coef(model)
+  term_names = names(coefficients)
+  term_names[term_names == "(Intercept)"] = "Intercept"
+
+  paste(
+    "force_lbf =",
+    paste(sprintf("%+.8g*%s", coefficients, term_names), collapse = " "),
+    collapse = " "
+  )
+}
+
+model_data = add_regression_columns(model_data, max_poly_degree)
+
 search_results = do.call(rbind, lapply(seq(max_poly_degree, min_poly_degree, by = -1), function(poly_degree) {
-  eqn = build_eqn(poly_degree)
+  eqn = build_eqn(build_terms(poly_degree))
   model = lm(eqn, data = model_data)
   model_summary = summary(model)
   coefficient_table = model_summary$coefficients
@@ -132,11 +196,17 @@ candidate_rows = search_results[
 candidate_rows = candidate_rows[order(candidate_rows$polynomial_degree, -candidate_rows$significant_fraction), , drop = FALSE]
 best_row = candidate_rows[1, , drop = FALSE]
 best_degree = best_row$polynomial_degree[1]
-best_eqn = build_eqn(best_degree)
+best_terms = build_terms(best_degree)
+best_eqn = build_eqn(best_terms)
 best_model = lm(best_eqn, data = model_data)
+reduced_result = reduce_until_all_terms_significant(best_terms, model_data, alpha_level)
+final_eqn = reduced_result$eqn
+final_model = reduced_result$model
 
 coefficient_table = summary(best_model)$coefficients
 anova_table = anova(best_model)
+final_coefficient_table = summary(final_model)$coefficients
+final_anova_table = anova(final_model)
 
 print("Adjusted R-squared search results:")
 print(search_results)
@@ -147,14 +217,32 @@ print(candidate_rows)
 print("Chosen polynomial degree with parsimony rule:")
 print(best_degree)
 
-print("Best model summary:")
+print("Chosen adjusted R-squared model summary before significance reduction:")
 print(summary(best_model))
 
-print("Best model coefficient table:")
+print("Chosen adjusted R-squared coefficient table before significance reduction:")
 print(coefficient_table)
 
-print("Best model ANOVA table:")
+print("Chosen adjusted R-squared ANOVA table before significance reduction:")
 print(anova_table)
 
-print("Final equation:")
+print("Chosen adjusted R-squared equation before significance reduction:")
 print(best_eqn)
+
+print("Removed terms from chosen model during significance reduction:")
+print(reduced_result$removed_terms)
+
+print("Final all-significant model summary:")
+print(summary(final_model))
+
+print("Final all-significant coefficient table:")
+print(final_coefficient_table)
+
+print("Final all-significant ANOVA table:")
+print(final_anova_table)
+
+print("Final all-significant equation:")
+print(final_eqn)
+
+print("Final all-significant equation with coefficients:")
+print(format_model_equation(final_model))

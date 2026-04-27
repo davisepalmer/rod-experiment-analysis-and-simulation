@@ -8,6 +8,7 @@ Interactive mode provides:
 - Reset simulation
 - Exact-value numeric entry for controls
 - Grain-size control with rebuild-on-run behavior
+- Adaptive fine/coarse DEM soil generation for small-particle studies
 - Solve-speed control
 - Pull-rate control
 - Force readout with a stop threshold
@@ -23,12 +24,17 @@ import argparse
 import csv
 import json
 import math
+import multiprocessing as mp
+import pickle
 import re
+import tempfile
 import time
+import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from queue import Empty
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import gmsh
 import matplotlib.pyplot as plt
@@ -65,9 +71,13 @@ INCH_TO_M = 0.0254
 LBF_PER_N = 0.2248089431
 N_PER_LBF = 1.0 / LBF_PER_N
 FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d*|\d+|\.\d+)(?:[Ee][-+]?\d+)?")
-MIN_GRAIN_RADIUS_IN = 0.05
-MAX_SOIL_PARTICLES = 80000
+MIN_GRAIN_RADIUS_IN = 0.01
+DEFAULT_MAX_SOIL_PARTICLES = 0
+LARGE_SOIL_WARNING_PARTICLES = 80000
 AUTO_PREVIEW_SOIL_PARTICLES = 4000
+DEFAULT_COARSE_PARTICLE_RADIUS_IN = 0.35
+DEFAULT_FINE_ZONE_MARGIN_IN = 1.5
+DEFAULT_MAX_PLAYBACK_MEMORY_MB = 768.0
 
 
 @dataclass
@@ -144,6 +154,11 @@ class SimulationParameters:
     pull_height_in: float = 17.5
     pull_angle_deg: float = 0.0
     simulation_speed: float = 1.0
+    soil_mode: str = "adaptive"
+    coarse_particle_radius_in: float = DEFAULT_COARSE_PARTICLE_RADIUS_IN
+    fine_zone_margin_in: float = DEFAULT_FINE_ZONE_MARGIN_IN
+    max_soil_particles: int = DEFAULT_MAX_SOIL_PARTICLES
+    max_playback_memory_mb: float = DEFAULT_MAX_PLAYBACK_MEMORY_MB
 
 
 @dataclass
@@ -187,6 +202,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pull-height-in", type=float, default=17.5)
     parser.add_argument("--pull-angle-deg", type=float, default=0.0)
     parser.add_argument("--simulation-speed", type=float, default=1.0)
+    parser.add_argument(
+        "--soil-mode",
+        choices=("adaptive", "full"),
+        default="adaptive",
+        help=(
+            "Soil particle layout. 'adaptive' keeps requested fine grains around the pull path "
+            "and uses coarser far-field grains; 'full' uses the requested grain size everywhere."
+        ),
+    )
+    parser.add_argument(
+        "--coarse-particle-radius-in",
+        type=float,
+        default=DEFAULT_COARSE_PARTICLE_RADIUS_IN,
+        help="Far-field particle radius for adaptive soil mode.",
+    )
+    parser.add_argument(
+        "--fine-zone-margin-in",
+        type=float,
+        default=DEFAULT_FINE_ZONE_MARGIN_IN,
+        help="Extra fine-grain margin around the anchor pull path in adaptive soil mode.",
+    )
+    parser.add_argument(
+        "--max-soil-particles",
+        type=int,
+        default=DEFAULT_MAX_SOIL_PARTICLES,
+        help="Optional hard particle cap. Use 0 to allow large runs.",
+    )
+    parser.add_argument(
+        "--max-playback-memory-mb",
+        type=float,
+        default=DEFAULT_MAX_PLAYBACK_MEMORY_MB,
+        help="Approximate memory budget for recorded GUI playback snapshots.",
+    )
     return parser.parse_args()
 
 
@@ -579,6 +627,12 @@ def create_soil_and_container(
     lateral_margin: float,
     bottom_margin: float,
     rng: np.random.Generator,
+    *,
+    soil_mode: str = "adaptive",
+    coarse_particle_radius: Optional[float] = None,
+    fine_zone_margin: float = DEFAULT_FINE_ZONE_MARGIN_IN * INCH_TO_M,
+    pull_distance: float = 0.0,
+    pull_angle_deg: float = 0.0,
 ) -> Tuple[List[int], Dict[str, float]]:
     base = anchor.base
     soil_bottom = anchor.base_bottom_y - bottom_margin
@@ -616,76 +670,221 @@ def create_soil_and_container(
         [0.75, 0.75, 0.78, 0.22],
     )
 
-    sphere_collision = p.createCollisionShape(p.GEOM_SPHERE, radius=particle_radius)
-    sphere_visual = p.createVisualShape(
-        p.GEOM_SPHERE,
-        radius=particle_radius,
-        rgbaColor=[0.58, 0.43, 0.28, 1.0],
+    fine_radius = max(1e-9, particle_radius)
+    coarse_radius = max(fine_radius, coarse_particle_radius or fine_radius)
+    use_adaptive = soil_mode == "adaptive" and coarse_radius > fine_radius * 1.01
+    fine_zone = fine_zone_bounds(
+        anchor=anchor,
+        margin=max(0.0, fine_zone_margin),
+        pull_distance=max(0.0, pull_distance),
+        pull_angle_deg=pull_angle_deg,
     )
-
-    sphere_volume = 4.0 / 3.0 * math.pi * particle_radius**3
-    sphere_mass = particle_density * sphere_volume
-
-    spacing = 2.08 * particle_radius
-    xs = np.arange(-soil_half_x + particle_radius, soil_half_x - particle_radius + 1e-9, spacing)
-    ys = np.arange(soil_bottom + particle_radius, anchor.surface_y - particle_radius + 1e-9, spacing)
-    zs = np.arange(-soil_half_z + particle_radius, soil_half_z - particle_radius + 1e-9, spacing)
-
+    shape_cache: Dict[Tuple[float, str], Tuple[int, int, float]] = {}
     particles: List[int] = []
-    for iy, y in enumerate(ys):
-        x_offset = (iy % 2) * particle_radius
-        for iz, z in enumerate(zs):
-            z_offset = ((iy + iz) % 2) * particle_radius * 0.5
-            for x in xs:
-                position = np.array(
-                    [
-                        x + x_offset - 0.5 * particle_radius,
-                        y,
-                        z + z_offset,
-                    ],
-                    dtype=float,
-                )
-                position += rng.uniform(-0.03 * particle_radius, 0.03 * particle_radius, size=3)
-                if position[1] > anchor.surface_y - 0.5 * particle_radius:
-                    continue
+    particle_counts = {"fine": 0, "coarse": 0}
 
-                occupied = point_inside_component(position, anchor.base, padding=1.15 * particle_radius)
-                if not occupied:
-                    occupied = any(
-                        point_inside_component(position, component, padding=0.9 * particle_radius)
-                        for component in anchor.links
+    def particle_shape(radius: float, region: str) -> Tuple[int, int, float]:
+        key = (round(radius, 9), region)
+        if key not in shape_cache:
+            color = [0.54, 0.39, 0.24, 1.0] if region == "fine" else [0.64, 0.51, 0.34, 1.0]
+            collision = p.createCollisionShape(p.GEOM_SPHERE, radius=radius)
+            visual = p.createVisualShape(p.GEOM_SPHERE, radius=radius, rgbaColor=color)
+            volume = 4.0 / 3.0 * math.pi * radius**3
+            shape_cache[key] = (collision, visual, particle_density * volume)
+        return shape_cache[key]
+
+    def in_soil_bounds(position: np.ndarray, radius: float) -> bool:
+        return (
+            -soil_half_x + radius <= position[0] <= soil_half_x - radius
+            and soil_bottom + radius <= position[1] <= anchor.surface_y - radius
+            and -soil_half_z + radius <= position[2] <= soil_half_z - radius
+        )
+
+    def in_fine_zone(position: np.ndarray, padding: float = 0.0) -> bool:
+        min_x, max_x, min_z, max_z = fine_zone
+        return (
+            min_x - padding <= position[0] <= max_x + padding
+            and min_z - padding <= position[2] <= max_z + padding
+        )
+
+    def blocked_by_anchor(position: np.ndarray, radius: float) -> bool:
+        occupied = point_inside_component(position, anchor.base, padding=1.15 * radius)
+        if occupied:
+            return True
+        return any(
+            point_inside_component(position, component, padding=0.9 * radius)
+            for component in anchor.links
+        )
+
+    def create_particle(position: np.ndarray, radius: float, region: str) -> None:
+        collision, visual, mass = particle_shape(radius, region)
+        body = p.createMultiBody(
+            baseMass=mass,
+            baseCollisionShapeIndex=collision,
+            baseVisualShapeIndex=visual,
+            basePosition=position.tolist(),
+        )
+        p.changeDynamics(
+            body,
+            -1,
+            lateralFriction=0.95,
+            rollingFriction=0.01,
+            spinningFriction=0.02,
+            restitution=0.0,
+            linearDamping=0.01,
+            angularDamping=0.01,
+        )
+        particles.append(body)
+        particle_counts[region] += 1
+
+    def generate_particles(radius: float, region: str) -> None:
+        spacing = 2.08 * radius
+        xs = np.arange(-soil_half_x + radius, soil_half_x - radius + 1e-9, spacing)
+        ys = np.arange(soil_bottom + radius, anchor.surface_y - radius + 1e-9, spacing)
+        zs = np.arange(-soil_half_z + radius, soil_half_z - radius + 1e-9, spacing)
+
+        for iy, y in enumerate(ys):
+            x_offset = (iy % 2) * radius
+            for iz, z in enumerate(zs):
+                z_offset = ((iy + iz) % 2) * radius * 0.5
+                for x in xs:
+                    position = np.array(
+                        [
+                            x + x_offset - 0.5 * radius,
+                            y,
+                            z + z_offset,
+                        ],
+                        dtype=float,
                     )
-                if occupied:
-                    continue
+                    position += rng.uniform(-0.03 * radius, 0.03 * radius, size=3)
+                    if not in_soil_bounds(position, radius):
+                        continue
+                    if region == "fine" and use_adaptive and not in_fine_zone(position):
+                        continue
+                    if region == "coarse" and in_fine_zone(position, padding=coarse_radius + fine_radius):
+                        continue
+                    if blocked_by_anchor(position, radius):
+                        continue
+                    create_particle(position, radius, region)
 
-                body = p.createMultiBody(
-                    baseMass=sphere_mass,
-                    baseCollisionShapeIndex=sphere_collision,
-                    baseVisualShapeIndex=sphere_visual,
-                    basePosition=position.tolist(),
-                )
-                p.changeDynamics(
-                    body,
-                    -1,
-                    lateralFriction=0.95,
-                    rollingFriction=0.01,
-                    spinningFriction=0.02,
-                    restitution=0.0,
-                    linearDamping=0.01,
-                    angularDamping=0.01,
-                )
-                particles.append(body)
+    if use_adaptive:
+        generate_particles(fine_radius, "fine")
+        generate_particles(coarse_radius, "coarse")
+    else:
+        generate_particles(fine_radius, "fine")
 
     return particles, {
         "soil_bottom": soil_bottom,
         "soil_half_x": soil_half_x,
         "soil_half_z": soil_half_z,
         "soil_height": soil_height,
+        "soil_mode": "adaptive" if use_adaptive else "full",
+        "fine_particle_radius_in": fine_radius / INCH_TO_M,
+        "coarse_particle_radius_in": coarse_radius / INCH_TO_M if use_adaptive else fine_radius / INCH_TO_M,
+        "fine_zone_margin_in": fine_zone_margin / INCH_TO_M,
+        "fine_zone_min_x_m": fine_zone[0],
+        "fine_zone_max_x_m": fine_zone[1],
+        "fine_zone_min_z_m": fine_zone[2],
+        "fine_zone_max_z_m": fine_zone[3],
+        "fine_particle_count": particle_counts["fine"],
+        "coarse_particle_count": particle_counts["coarse"],
         "particle_count": len(particles),
     }
 
 
+def fine_zone_bounds(
+    anchor: AnchorAssembly,
+    margin: float,
+    pull_distance: float,
+    pull_angle_deg: float,
+) -> Tuple[float, float, float, float]:
+    components = [anchor.base, *anchor.links]
+    min_x = math.inf
+    max_x = -math.inf
+    min_z = math.inf
+    max_z = -math.inf
+    for component in components:
+        axis_aligned_half_extents = np.abs(component.rel_rotation) @ component.half_extents
+        center = component.rel_position
+        min_x = min(min_x, float(center[0] - axis_aligned_half_extents[0]))
+        max_x = max(max_x, float(center[0] + axis_aligned_half_extents[0]))
+        min_z = min(min_z, float(center[2] - axis_aligned_half_extents[2]))
+        max_z = max(max_z, float(center[2] + axis_aligned_half_extents[2]))
+
+    angle = math.radians(pull_angle_deg)
+    pull_offset = np.array([math.cos(angle) * pull_distance, math.sin(angle) * pull_distance])
+    return (
+        min(min_x, min_x + pull_offset[0]) - margin,
+        max(max_x, max_x + pull_offset[0]) + margin,
+        min(min_z, min_z + pull_offset[1]) - margin,
+        max(max_z, max_z + pull_offset[1]) + margin,
+    )
+
+
 def estimate_soil_particle_upper_bound(
+    anchor: AnchorAssembly,
+    particle_radius: float,
+    lateral_margin: float,
+    bottom_margin: float,
+    *,
+    soil_mode: str = "adaptive",
+    coarse_particle_radius: Optional[float] = None,
+    fine_zone_margin: float = DEFAULT_FINE_ZONE_MARGIN_IN * INCH_TO_M,
+    pull_distance: float = 0.0,
+    pull_angle_deg: float = 0.0,
+) -> int:
+    base = anchor.base
+    soil_bottom = anchor.base_bottom_y - bottom_margin
+    soil_half_x = max(base.half_extents[0] + lateral_margin, 0.14)
+    soil_half_z = max(base.half_extents[2] + lateral_margin, 0.14)
+    fine_radius = max(1e-9, particle_radius)
+    coarse_radius = max(fine_radius, coarse_particle_radius or fine_radius)
+    use_adaptive = soil_mode == "adaptive" and coarse_radius > fine_radius * 1.01
+    fine_zone = fine_zone_bounds(
+        anchor=anchor,
+        margin=max(0.0, fine_zone_margin),
+        pull_distance=max(0.0, pull_distance),
+        pull_angle_deg=pull_angle_deg,
+    )
+
+    def axis_count(lower: float, upper: float, spacing: float) -> int:
+        if upper < lower:
+            return 0
+        return int(math.floor((upper - lower) / spacing)) + 1
+
+    def grid_count(radius: float, bounds: Optional[Tuple[float, float, float, float]] = None) -> int:
+        spacing = max(1e-9, 2.08 * radius)
+        if bounds is None:
+            lower_x = -soil_half_x + radius
+            upper_x = soil_half_x - radius
+            lower_z = -soil_half_z + radius
+            upper_z = soil_half_z - radius
+        else:
+            lower_x = max(-soil_half_x + radius, bounds[0])
+            upper_x = min(soil_half_x - radius, bounds[1])
+            lower_z = max(-soil_half_z + radius, bounds[2])
+            upper_z = min(soil_half_z - radius, bounds[3])
+        x_count = axis_count(lower_x, upper_x, spacing)
+        y_count = axis_count(soil_bottom + radius, anchor.surface_y - radius, spacing)
+        z_count = axis_count(lower_z, upper_z, spacing)
+        return max(0, x_count * y_count * z_count)
+
+    if not use_adaptive:
+        return grid_count(fine_radius)
+
+    fine_count = grid_count(fine_radius, fine_zone)
+    expanded_fine_zone = (
+        fine_zone[0] - coarse_radius - fine_radius,
+        fine_zone[1] + coarse_radius + fine_radius,
+        fine_zone[2] - coarse_radius - fine_radius,
+        fine_zone[3] + coarse_radius + fine_radius,
+    )
+    full_coarse_count = grid_count(coarse_radius)
+    skipped_coarse_count = grid_count(coarse_radius, expanded_fine_zone)
+    return max(0, fine_count + full_coarse_count - skipped_coarse_count)
+
+
+def estimate_full_soil_particle_upper_bound(
     anchor: AnchorAssembly,
     particle_radius: float,
     lateral_margin: float,
@@ -706,6 +905,20 @@ def estimate_soil_particle_upper_bound(
     y_count = axis_count(soil_bottom + particle_radius, anchor.surface_y - particle_radius)
     z_count = axis_count(-soil_half_z + particle_radius, soil_half_z - particle_radius)
     return max(0, x_count * y_count * z_count)
+
+
+def estimate_particle_count_for_settings(anchor: AnchorAssembly, settings: SimulationParameters) -> int:
+    return estimate_soil_particle_upper_bound(
+        anchor=anchor,
+        particle_radius=settings.particle_radius_in * INCH_TO_M,
+        lateral_margin=settings.soil_lateral_margin_in * INCH_TO_M,
+        bottom_margin=settings.soil_bottom_margin_in * INCH_TO_M,
+        soil_mode=settings.soil_mode,
+        coarse_particle_radius=settings.coarse_particle_radius_in * INCH_TO_M,
+        fine_zone_margin=settings.fine_zone_margin_in * INCH_TO_M,
+        pull_distance=settings.pull_distance_in * INCH_TO_M,
+        pull_angle_deg=settings.pull_angle_deg,
+    )
 
 
 def rotate_vector(quaternion_xyzw: Iterable[float], vector: np.ndarray) -> np.ndarray:
@@ -751,8 +964,85 @@ def settings_from_args(args: argparse.Namespace, anchor: AnchorAssembly) -> Simu
         pull_height_in=args.pull_height_in,
         pull_angle_deg=args.pull_angle_deg,
         simulation_speed=args.simulation_speed,
+        soil_mode=args.soil_mode,
+        coarse_particle_radius_in=args.coarse_particle_radius_in,
+        fine_zone_margin_in=args.fine_zone_margin_in,
+        max_soil_particles=args.max_soil_particles,
+        max_playback_memory_mb=args.max_playback_memory_mb,
     )
     return replace(settings, pull_height_in=clamp_pull_height(anchor, settings.pull_height_in))
+
+
+def solve_simulation_worker(
+    anchor: AnchorAssembly,
+    settings: SimulationParameters,
+    result_queue: mp.Queue,
+    stop_event: mp.Event,
+    pause_event: mp.Event,
+) -> None:
+    """Run PyBullet in a separate process so Tk remains responsive."""
+    engine: Optional[SimulationEngine] = None
+    try:
+        engine = SimulationEngine(anchor, connection_mode=p.DIRECT)
+        engine.reset(settings)
+        result_queue.put(
+            {
+                "type": "started",
+                "status": engine.current_status(settings),
+                "particle_count": len(engine.particles),
+            }
+        )
+
+        last_progress_time = time.perf_counter()
+        while not engine.done and not stop_event.is_set():
+            if pause_event.is_set():
+                time.sleep(0.03)
+                continue
+
+            row = engine.step(settings)
+            now = time.perf_counter()
+            if now - last_progress_time >= 0.18 or engine.done:
+                result_queue.put(
+                    {
+                        "type": "progress",
+                        "row": row,
+                        "status": engine.current_status(settings),
+                        "row_count": len(engine.history),
+                    }
+                )
+                last_progress_time = now
+
+        if stop_event.is_set():
+            result_queue.put({"type": "cancelled"})
+            return
+
+        completed_run = {
+            "settings": settings,
+            "history": engine.history,
+            "summary": engine.summary(settings),
+            "geometry_metadata": engine.geometry_metadata(settings),
+            "snapshots": engine.snapshots,
+            "soil_info": engine.soil_info,
+            "anchor_mass_kg": engine.anchor_mass_kg,
+            "peak_force_n": engine.peak_force_n,
+            "extracted_time_s": engine.extracted_time_s,
+            "status": engine.current_status(settings),
+        }
+        with tempfile.NamedTemporaryFile(prefix="pole_pullout_run_", suffix=".pkl", delete=False) as handle:
+            pickle.dump(completed_run, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            result_path = handle.name
+        result_queue.put({"type": "complete", "result_path": result_path})
+    except Exception as exc:  # pragma: no cover - exercised through GUI runtime
+        result_queue.put(
+            {
+                "type": "error",
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+    finally:
+        if engine is not None:
+            engine.disconnect()
 
 
 class SimulationEngine:
@@ -839,19 +1129,52 @@ class SimulationEngine:
             p.resetBaseVelocity(self.anchor_body, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
             p.stepSimulation()
 
+    def _memory_limited_snapshot_stride(self, settings: SimulationParameters, particle_count: int) -> int:
+        pull_speed_mps = settings.pull_speed_in_per_s * INCH_TO_M
+        if pull_speed_mps <= 1e-9:
+            return 1
+
+        max_time_s = settings.pull_distance_in * INCH_TO_M / pull_speed_mps
+        steps_per_engine_step = max(1, self.force_measurement_substeps)
+        expected_engine_steps = max(
+            1,
+            int(math.ceil(max_time_s / (settings.time_step * steps_per_engine_step))),
+        )
+        bytes_per_snapshot = max(1, particle_count) * 3 * np.dtype(np.float32).itemsize
+        memory_budget_bytes = max(16.0, settings.max_playback_memory_mb) * 1024.0 * 1024.0
+        max_snapshots = max(2, int(memory_budget_bytes // max(1, bytes_per_snapshot)))
+        return max(1, int(math.ceil(expected_engine_steps / max_snapshots)))
+
     def reset(self, settings: SimulationParameters) -> None:
-        settings = replace(settings, pull_height_in=clamp_pull_height(self.anchor, settings.pull_height_in))
-        estimated_particle_upper_bound = estimate_soil_particle_upper_bound(
+        if settings.particle_radius_in <= 0.0:
+            raise ValueError("Particle radius must be positive.")
+        settings = replace(
+            settings,
+            pull_height_in=clamp_pull_height(self.anchor, settings.pull_height_in),
+            coarse_particle_radius_in=max(settings.particle_radius_in, settings.coarse_particle_radius_in),
+            fine_zone_margin_in=max(0.0, settings.fine_zone_margin_in),
+            max_soil_particles=max(0, settings.max_soil_particles),
+            max_playback_memory_mb=max(16.0, settings.max_playback_memory_mb),
+        )
+        estimated_particle_upper_bound = estimate_particle_count_for_settings(self.anchor, settings)
+        estimated_full_particle_upper_bound = estimate_full_soil_particle_upper_bound(
             anchor=self.anchor,
             particle_radius=settings.particle_radius_in * INCH_TO_M,
             lateral_margin=settings.soil_lateral_margin_in * INCH_TO_M,
             bottom_margin=settings.soil_bottom_margin_in * INCH_TO_M,
         )
-        if estimated_particle_upper_bound > MAX_SOIL_PARTICLES:
+        if settings.max_soil_particles > 0 and estimated_particle_upper_bound > settings.max_soil_particles:
             raise ValueError(
-                "Chosen grain size is too fine for this PyBullet model. "
+                "The requested soil model exceeds the configured particle cap. "
                 f"It would create about {estimated_particle_upper_bound:,} particles; "
-                "increase the grain size or move to a higher-fidelity DEM tool for finer soil."
+                f"increase --max-soil-particles above that value or set it to 0 for no cap."
+            )
+        if estimated_particle_upper_bound > LARGE_SOIL_WARNING_PARTICLES:
+            print(
+                "Large soil model warning: about "
+                f"{estimated_particle_upper_bound:,} particles will be created. "
+                "This may take a long time and use substantial RAM.",
+                flush=True,
             )
 
         self.settings = settings
@@ -869,8 +1192,14 @@ class SimulationEngine:
             lateral_margin=settings.soil_lateral_margin_in * INCH_TO_M,
             bottom_margin=settings.soil_bottom_margin_in * INCH_TO_M,
             rng=rng,
+            soil_mode=settings.soil_mode,
+            coarse_particle_radius=settings.coarse_particle_radius_in * INCH_TO_M,
+            fine_zone_margin=settings.fine_zone_margin_in * INCH_TO_M,
+            pull_distance=settings.pull_distance_in * INCH_TO_M,
+            pull_angle_deg=settings.pull_angle_deg,
         )
         self.soil_info["estimated_particle_upper_bound"] = estimated_particle_upper_bound
+        self.soil_info["estimated_full_fine_particle_upper_bound"] = estimated_full_particle_upper_bound
         self._create_pull_markers()
         self._hold_anchor_during_settle(settings)
 
@@ -882,7 +1211,11 @@ class SimulationEngine:
         self.done = False
         self.step_index = 0
         self.force_measurement_substeps = max(1, min(6, int(round(0.0125 / settings.time_step))))
-        self.snapshot_stride = max(1, int(round(settings.capture_every / self.force_measurement_substeps)))
+        base_snapshot_stride = max(1, int(round(settings.capture_every / self.force_measurement_substeps)))
+        self.snapshot_stride = max(
+            base_snapshot_stride,
+            self._memory_limited_snapshot_stride(settings, len(self.particles)),
+        )
         self.base_start_position, self.base_start_quaternion = base_state(self.anchor_body)
         self.last_force_world = np.zeros(3)
         self.last_target_world = self.neutral_pull_origin(settings)
@@ -1168,6 +1501,10 @@ class SimulationEngine:
             "object_mass_kg": pounds_to_kg(settings.object_mass_lb),
             "pull_height_in": settings.pull_height_in,
             "pull_angle_deg": settings.pull_angle_deg,
+            "soil_mode": settings.soil_mode,
+            "particle_radius_in": settings.particle_radius_in,
+            "coarse_particle_radius_in": settings.coarse_particle_radius_in,
+            "fine_zone_margin_in": settings.fine_zone_margin_in,
             "base_size_in": (self.anchor.base.dims / INCH_TO_M).tolist(),
             "anchor_to_particle_diameter_ratio": self.anchor.base.dims[0] / max(
                 2.0 * settings.particle_radius_in * INCH_TO_M,
@@ -1189,6 +1526,10 @@ class SimulationEngine:
             "force_stop_threshold_lbf": settings.pull_force_lbf,
             "pull_height_in": settings.pull_height_in,
             "pull_angle_deg": settings.pull_angle_deg,
+            "soil_mode": settings.soil_mode,
+            "particle_radius_in": settings.particle_radius_in,
+            "coarse_particle_radius_in": settings.coarse_particle_radius_in,
+            "fine_zone_margin_in": settings.fine_zone_margin_in,
             "peak_force_lbf": self.peak_force_n * LBF_PER_N,
             "peak_force_n": self.peak_force_n,
             "anchor_mass_kg": self.anchor_mass_kg,
@@ -1333,16 +1674,22 @@ class InteractivePulloutApp:
         self.output_root = args.output_dir
         self.engine = SimulationEngine(anchor, connection_mode=p.DIRECT)
         self.solve_running = False
+        self.solve_paused = False
         self.playback_running = False
         self.playback_index = 0
         self.pending_reset = False
-        self._step_budget = 0.0
         self._playback_budget = 0.0
         self._last_tick_time = time.perf_counter()
         self._last_view_refresh = 0.0
         self._last_plot_refresh = 0.0
         self._viewport_photo = None
         self.playback_fps = 15.0
+        self.solve_process: Optional[mp.Process] = None
+        self.solve_queue: Optional[mp.Queue] = None
+        self.solve_stop_event: Optional[mp.Event] = None
+        self.solve_pause_event: Optional[mp.Event] = None
+        self.solve_status: Optional[Dict[str, float]] = None
+        self.solve_progress_rows: List[Dict[str, float]] = []
 
         self.settings = settings_from_args(args, anchor)
         min_height, max_height = get_pull_height_limits(anchor)
@@ -1774,8 +2121,12 @@ class InteractivePulloutApp:
         )
 
     def _on_slider_change(self, live: bool) -> None:
+        if self.solve_running:
+            self.pending_reset = True
+            self.message_var.set("Active run settings are locked. Reset after this solve to apply control changes.")
+            return
         if live:
-            self.message_var.set("Live controls update during the run. Reset applies any soil changes.")
+            self.message_var.set("Live controls update the preview. Reset applies any soil changes.")
         else:
             self._mark_pending_reset()
 
@@ -1792,6 +2143,11 @@ class InteractivePulloutApp:
             particle_radius=max(MIN_GRAIN_RADIUS_IN, self.grain_size_var.get()) * INCH_TO_M,
             lateral_margin=self.settings.soil_lateral_margin_in * INCH_TO_M,
             bottom_margin=self.settings.soil_bottom_margin_in * INCH_TO_M,
+            soil_mode=self.settings.soil_mode,
+            coarse_particle_radius=self.settings.coarse_particle_radius_in * INCH_TO_M,
+            fine_zone_margin=self.settings.fine_zone_margin_in * INCH_TO_M,
+            pull_distance=self.pull_distance_var.get() * INCH_TO_M,
+            pull_angle_deg=self.pull_angle_var.get(),
         )
         if preview_particle_upper_bound > AUTO_PREVIEW_SOIL_PARTICLES:
             self.pending_reset = True
@@ -1827,9 +2183,268 @@ class InteractivePulloutApp:
     def playback_settings(self) -> SimulationParameters:
         return self.engine.settings or self.settings
 
+    def _release_solver_handles(self) -> None:
+        process = self.solve_process
+        if process is not None and not process.is_alive():
+            process.join(timeout=0.05)
+        if self.solve_queue is not None:
+            try:
+                self.solve_queue.close()
+            except (OSError, ValueError):
+                pass
+        self.solve_process = None
+        self.solve_queue = None
+        self.solve_stop_event = None
+        self.solve_pause_event = None
+
+    def _stop_background_solve(self, *, terminate: bool) -> None:
+        if self.solve_stop_event is not None:
+            self.solve_stop_event.set()
+        if self.solve_pause_event is not None:
+            self.solve_pause_event.clear()
+
+        process = self.solve_process
+        if process is not None and process.is_alive():
+            process.join(timeout=0.35)
+            if terminate and process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
+
+        self.solve_running = False
+        self.solve_paused = False
+        self._release_solver_handles()
+
+    def _start_background_solve(self) -> None:
+        if self.solve_running:
+            return
+
+        run_settings = self.current_settings()
+        if run_settings.particle_radius_in <= 0.0:
+            self.pending_reset = True
+            self.status_var.set("Build Error")
+            self.message_var.set("Particle radius must be positive.")
+            self._set_play_button_text()
+            return
+        run_settings = replace(
+            run_settings,
+            coarse_particle_radius_in=max(run_settings.particle_radius_in, run_settings.coarse_particle_radius_in),
+            fine_zone_margin_in=max(0.0, run_settings.fine_zone_margin_in),
+            max_soil_particles=max(0, run_settings.max_soil_particles),
+            max_playback_memory_mb=max(16.0, run_settings.max_playback_memory_mb),
+        )
+        estimated_particle_count = estimate_particle_count_for_settings(self.anchor, run_settings)
+        if run_settings.max_soil_particles > 0 and estimated_particle_count > run_settings.max_soil_particles:
+            self.pending_reset = True
+            self.status_var.set("Build Error")
+            self.message_var.set(
+                f"Run would create about {estimated_particle_count:,} particles, above --max-soil-particles."
+            )
+            self._set_play_button_text()
+            return
+
+        self.settings = run_settings
+        self.pending_reset = False
+        self.playback_running = False
+        self.playback_index = 0
+        self.solve_status = {
+            "time_s": 0.0,
+            "force_total_lbf": 0.0,
+            "force_vertical_lbf": 0.0,
+            "displacement_along_dir_in": 0.0,
+            "commanded_displacement_in": 0.0,
+            "particle_count": float(estimated_particle_count),
+        }
+        self.solve_progress_rows = []
+
+        context = mp.get_context("spawn")
+        self.solve_queue = context.Queue()
+        self.solve_stop_event = context.Event()
+        self.solve_pause_event = context.Event()
+        self.solve_process = context.Process(
+            target=solve_simulation_worker,
+            args=(
+                self.anchor,
+                run_settings,
+                self.solve_queue,
+                self.solve_stop_event,
+                self.solve_pause_event,
+            ),
+            name="pole-pullout-solver",
+            daemon=True,
+        )
+        try:
+            self.solve_process.start()
+        except Exception as exc:
+            self._stop_background_solve(terminate=True)
+            self.status_var.set("Start Error")
+            self.message_var.set(f"Could not start background solver: {exc}")
+            self._set_play_button_text()
+            return
+
+        self.solve_running = True
+        self.solve_paused = False
+        self._playback_budget = 0.0
+        self._last_tick_time = time.perf_counter()
+        self.status_var.set("Solving")
+        self.preview_note_var.set(
+            "Background solve in progress. The UI stays responsive; playback is loaded when the run finishes."
+        )
+        self.message_var.set("Solving in a separate process. Controls changed during this run apply after Reset.")
+        self.export_var.set("No export yet")
+        self._refresh_viewport(force=True)
+        self._refresh_plot(force=True)
+        self._set_play_button_text()
+
+    def _pause_background_solve(self) -> None:
+        if not self.solve_running or self.solve_pause_event is None:
+            return
+        self.solve_pause_event.set()
+        self.solve_paused = True
+        self.status_var.set("Solve Paused")
+        self.preview_note_var.set("Background solve is paused. Resume to continue or Reset to cancel and rebuild.")
+        self.message_var.set("Solve paused. The current run settings are preserved in the worker process.")
+        self._set_play_button_text()
+
+    def _resume_background_solve(self) -> None:
+        if not self.solve_running or self.solve_pause_event is None:
+            return
+        self.solve_pause_event.clear()
+        self.solve_paused = False
+        self._last_tick_time = time.perf_counter()
+        self.status_var.set("Solving")
+        self.preview_note_var.set(
+            "Background solve in progress. The UI stays responsive; playback is loaded when the run finishes."
+        )
+        self.message_var.set("Solve resumed.")
+        self._set_play_button_text()
+
+    def _load_completed_run(self, message: Dict[str, Any]) -> None:
+        result_path = message.get("result_path")
+        if result_path is not None:
+            path = Path(result_path)
+            try:
+                with path.open("rb") as handle:
+                    message = pickle.load(handle)
+            finally:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+        run_settings = message["settings"]
+        snapshots = message.get("snapshots", [])
+        if snapshots:
+            expected_particles = len(snapshots[0].particle_positions)
+            if expected_particles != len(self.engine.particles):
+                self.engine.reset(run_settings)
+
+        self.settings = run_settings
+        self.engine.settings = run_settings
+        self.engine.history = message.get("history", [])
+        self.engine.snapshots = snapshots
+        self.engine.soil_info = message.get("soil_info", {})
+        self.engine.anchor_mass_kg = float(message.get("anchor_mass_kg", self.engine.anchor_mass_kg))
+        self.engine.peak_force_n = float(message.get("peak_force_n", 0.0))
+        self.engine.extracted_time_s = message.get("extracted_time_s")
+        self.engine.done = True
+        self.engine.step_index = len(self.engine.history)
+        self.solve_status = message.get("status")
+        self.solve_progress_rows = self.engine.history
+
+        self.solve_running = False
+        self.solve_paused = False
+        self.playback_running = False
+        self.playback_index = 0
+        self._playback_budget = 0.0
+        self._release_solver_handles()
+
+        if self.engine.snapshots:
+            self.engine.load_snapshot(0, run_settings)
+        self.preview_note_var.set("Solve complete. Use Play Playback to review the recorded run frame by frame.")
+        self.message_var.set("Run complete. Playback and export are ready.")
+        self._refresh_viewport(force=True)
+        self._refresh_plot(force=True)
+        self._set_play_button_text()
+
+    def _handle_solver_message(self, message: Dict[str, Any]) -> None:
+        message_type = message.get("type")
+        if message_type == "started":
+            self.solve_status = message.get("status")
+            self.particles_var.set(f"{int(message.get('particle_count', 0))}")
+            return
+
+        if message_type == "progress":
+            self.solve_status = message.get("status")
+            row = message.get("row")
+            if row is not None:
+                self.solve_progress_rows.append(row)
+            return
+
+        if message_type == "complete":
+            self._load_completed_run(message)
+            return
+
+        if message_type == "cancelled":
+            self.solve_running = False
+            self.solve_paused = False
+            self._release_solver_handles()
+            self.status_var.set("Paused")
+            self.preview_note_var.set("Solve cancelled. Press Run Simulation to start again.")
+            self.message_var.set("Background solve cancelled.")
+            self._set_play_button_text()
+            return
+
+        if message_type == "error":
+            self.solve_running = False
+            self.solve_paused = False
+            self._release_solver_handles()
+            self.status_var.set("Solve Error")
+            self.preview_note_var.set("The background solver failed. Check the terminal output for the traceback.")
+            self.message_var.set(str(message.get("message", "Unknown solver error.")))
+            traceback_text = message.get("traceback")
+            if traceback_text:
+                print(traceback_text)
+            self._set_play_button_text()
+
+    def _drain_solver_messages(self) -> None:
+        result_queue = self.solve_queue
+        if result_queue is None:
+            return
+
+        while True:
+            try:
+                message = result_queue.get_nowait()
+            except Empty:
+                break
+            self._handle_solver_message(message)
+            if self.solve_queue is None:
+                return
+
+        process = self.solve_process
+        if self.solve_running and process is not None and not process.is_alive():
+            time.sleep(0.02)
+            while self.solve_queue is not None:
+                try:
+                    message = self.solve_queue.get_nowait()
+                except Empty:
+                    break
+                self._handle_solver_message(message)
+                if self.solve_queue is None:
+                    return
+            if not self.solve_running:
+                return
+            exitcode = process.exitcode
+            self.solve_running = False
+            self.solve_paused = False
+            self._release_solver_handles()
+            self.status_var.set("Solve Error")
+            self.preview_note_var.set("The background solver exited before returning a completed run.")
+            self.message_var.set(f"Background solver exited unexpectedly with code {exitcode}.")
+            self._set_play_button_text()
+
     def _set_play_button_text(self) -> None:
         if self.solve_running:
-            self.play_button_var.set("Pause Solve")
+            self.play_button_var.set("Resume Solve" if self.solve_paused else "Pause Solve")
         elif not self.engine.done:
             self.play_button_var.set("Run Simulation")
         elif self.playback_running:
@@ -1838,27 +2453,18 @@ class InteractivePulloutApp:
             self.play_button_var.set("Play Playback")
 
     def toggle_play_pause(self) -> None:
-        if self.pending_reset and not self.solve_running and not self.playback_running:
-            if not self.reset_simulation():
-                return
+        if self.solve_running:
+            if self.solve_paused:
+                self._resume_background_solve()
+            else:
+                self._pause_background_solve()
+            return
 
         if not self.engine.done:
-            self.solve_running = not self.solve_running
-            self.playback_running = False
-            if self.solve_running:
-                self.status_var.set("Solving")
-                self.preview_note_var.set(
-                    "Fast solve in progress. Live viewport updates are paused until the run completes."
-                )
-                self.message_var.set(
-                    "Simulation solving in fast mode. Pull path and force readout update from the recorded run state."
-                )
-            else:
-                self.status_var.set("Paused")
-                self.preview_note_var.set(
-                    "Simulation paused at the current state. Press Run Simulation to continue."
-                )
-                self.message_var.set("Simulation paused. Adjust parameters or reset to restart from the beginning.")
+            if self.pending_reset and not self.reset_simulation():
+                return
+            self._start_background_solve()
+            return
         else:
             if not self.engine.snapshots:
                 self.message_var.set("No playback snapshots are available for this run.")
@@ -1879,18 +2485,58 @@ class InteractivePulloutApp:
                 self.message_var.set("Playback paused.")
         self._set_play_button_text()
 
+    def _preview_settings_for(self, settings: SimulationParameters) -> Tuple[SimulationParameters, bool, int]:
+        requested_count = estimate_particle_count_for_settings(self.anchor, settings)
+        if requested_count <= AUTO_PREVIEW_SOIL_PARTICLES:
+            return settings, False, requested_count
+
+        preview_settings = replace(settings, max_soil_particles=0)
+        for _ in range(24):
+            preview_settings = replace(
+                preview_settings,
+                particle_radius_in=preview_settings.particle_radius_in * 1.25,
+                coarse_particle_radius_in=max(
+                    preview_settings.coarse_particle_radius_in,
+                    preview_settings.particle_radius_in * 1.25,
+                ),
+            )
+            preview_count = estimate_particle_count_for_settings(self.anchor, preview_settings)
+            if preview_count <= AUTO_PREVIEW_SOIL_PARTICLES:
+                return preview_settings, True, requested_count
+
+        return preview_settings, True, requested_count
+
     def reset_simulation(self) -> bool:
+        if self.solve_running or self.solve_process is not None:
+            self._stop_background_solve(terminate=True)
         self.solve_running = False
+        self.solve_paused = False
         self.playback_running = False
         self.playback_index = 0
+        self.solve_status = None
+        self.solve_progress_rows = []
         next_settings = self.current_settings()
+        if next_settings.particle_radius_in <= 0.0:
+            self.pending_reset = True
+            self.status_var.set("Build Error")
+            self.message_var.set("Particle radius must be positive.")
+            self._set_play_button_text()
+            return False
+        next_settings = replace(
+            next_settings,
+            coarse_particle_radius_in=max(next_settings.particle_radius_in, next_settings.coarse_particle_radius_in),
+            fine_zone_margin_in=max(0.0, next_settings.fine_zone_margin_in),
+            max_soil_particles=max(0, next_settings.max_soil_particles),
+            max_playback_memory_mb=max(16.0, next_settings.max_playback_memory_mb),
+        )
+        preview_settings, preview_is_coarsened, requested_particle_count = self._preview_settings_for(next_settings)
         try:
-            self.engine.reset(next_settings)
+            self.engine.reset(preview_settings)
         except ValueError as exc:
             self.pending_reset = True
             self.status_var.set("Build Error")
             self.preview_note_var.set(
-                "The requested soil bed is too fine for this PyBullet build. Increase grain size or reduce model cost."
+                "The requested soil bed could not be built for preview. Adjust particle settings or run batch mode."
             )
             self.message_var.set(str(exc))
             self._set_play_button_text()
@@ -1898,14 +2544,19 @@ class InteractivePulloutApp:
 
         self.settings = next_settings
         self.pending_reset = False
-        self._step_budget = 0.0
         self._playback_budget = 0.0
         self._last_tick_time = time.perf_counter()
         self.status_var.set("Paused")
         self.preview_note_var.set(
             "Ready to solve. Press Run Simulation for a fast solve, then review the playback afterward."
         )
-        self.message_var.set("Simulation reset and paused at the beginning with the current settings.")
+        if preview_is_coarsened:
+            self.message_var.set(
+                "Large run ready. The viewport preview uses coarser particles; Run Simulation uses "
+                f"the requested settings and about {requested_particle_count:,} particles."
+            )
+        else:
+            self.message_var.set("Simulation reset and paused at the beginning with the current settings.")
         self.export_var.set("No export yet")
         self._set_play_button_text()
         self.engine.load_snapshot(0, self.settings)
@@ -1915,18 +2566,22 @@ class InteractivePulloutApp:
         return True
 
     def _update_status_text(self) -> None:
-        status_settings = self.playback_settings() if self.engine.done else self.current_settings()
-        status = self.engine.current_status(status_settings)
+        if self.solve_running and self.solve_status is not None:
+            status_settings = self.settings
+            status = self.solve_status
+        else:
+            status_settings = self.playback_settings() if self.engine.done else self.current_settings()
+            status = self.engine.current_status(status_settings)
         self.time_var.set(f"{status['time_s']:.2f} s")
         self.force_var.set(f"{status['force_total_lbf']:.1f} lbf")
         self.vertical_force_var.set(f"{status['force_vertical_lbf']:.1f} lbf vertical")
         self.displacement_var.set(f"{status['displacement_along_dir_in']:.2f} in")
         self.command_var.set(f"{status['commanded_displacement_in']:.2f} in")
-        self.mass_var.set(f"{self.playback_settings().object_mass_lb:.1f} lb")
+        self.mass_var.set(f"{status_settings.object_mass_lb:.1f} lb")
         self.particles_var.set(f"{int(status['particle_count'])}")
 
         if self.solve_running:
-            self.status_var.set("Solving")
+            self.status_var.set("Solve Paused" if self.solve_paused else "Solving")
         elif self.playback_running:
             self.status_var.set("Playing Back")
         elif self.engine.done:
@@ -1940,11 +2595,9 @@ class InteractivePulloutApp:
         now = time.perf_counter()
         if not force and now - self._last_plot_refresh < 0.18:
             return
-        if self.solve_running and not force:
-            return
         self._last_plot_refresh = now
 
-        rows = self.engine.history
+        rows = self.solve_progress_rows if self.solve_running else self.engine.history
         if rows:
             x_values = [row["measured_displacement_in"] for row in rows]
             y_values = [row["measured_pull_force_lbf"] for row in rows]
@@ -1974,6 +2627,12 @@ class InteractivePulloutApp:
         self.viewport_label.configure(image=self._viewport_photo)
 
     def export_results(self) -> None:
+        if self.solve_running:
+            self.message_var.set("Wait for the background solve to finish, or reset to cancel it, before exporting.")
+            return
+        if not self.engine.history:
+            self.message_var.set("No completed run is available to export yet.")
+            return
         session_dir = self.output_root / f"interactive_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         outputs = export_results(
             output_dir=session_dir,
@@ -1988,34 +2647,19 @@ class InteractivePulloutApp:
             self.message_var.set(f"Current run exported to {session_dir}.")
 
     def _tick(self) -> None:
+        self._drain_solver_messages()
         now = time.perf_counter()
         elapsed = min(now - self._last_tick_time, 0.25)
         self._last_tick_time = now
-        settings = self.current_settings()
-        self.settings = settings
-        if abs(self.pull_height_var.get() - settings.pull_height_in) > 1e-9:
-            self.pull_height_var.set(settings.pull_height_in)
-
         if self.solve_running:
-            steps_to_run = min(2000, max(1, int(120 * settings.simulation_speed)))
-            for _ in range(steps_to_run):
-                self.engine.step(settings)
-                if self.engine.done:
-                    break
-            if self.engine.done:
-                self.solve_running = False
-                self.playback_running = False
-                self.playback_index = 0
-                self._playback_budget = 0.0
-                self.engine.load_snapshot(0, settings)
-                self.preview_note_var.set(
-                    "Solve complete. Use Play Playback to review the recorded run frame by frame."
-                )
-                self.message_var.set(
-                    "Run complete. Playback is ready. Reset starts over from the beginning and stays paused."
-                )
-                self._set_play_button_text()
-        elif self.playback_running:
+            settings = self.settings
+        else:
+            settings = self.current_settings()
+            self.settings = settings
+            if abs(self.pull_height_var.get() - settings.pull_height_in) > 1e-9:
+                self.pull_height_var.set(settings.pull_height_in)
+
+        if self.playback_running:
             if self.engine.snapshots:
                 self._playback_budget += elapsed * self.playback_fps
                 frames_to_advance = max(1, int(self._playback_budget))
@@ -2033,13 +2677,13 @@ class InteractivePulloutApp:
                     self.message_var.set("Playback complete.")
                     self._set_play_button_text()
         else:
-            self.engine.refresh_markers(settings)
+            if not self.solve_running:
+                self.engine.refresh_markers(settings)
 
         self._update_status_text()
         if not self.solve_running:
             self._refresh_viewport()
-        if not self.solve_running or self.engine.done:
-            self._refresh_plot()
+        self._refresh_plot()
         self.root.after(30, self._tick)
 
     def run(self) -> None:
@@ -2047,6 +2691,8 @@ class InteractivePulloutApp:
 
     def close(self) -> None:
         try:
+            if self.solve_running or self.solve_process is not None:
+                self._stop_background_solve(terminate=True)
             self.engine.disconnect()
         finally:
             self.root.destroy()
@@ -2058,6 +2704,7 @@ def launch_interactive_app(anchor: AnchorAssembly, args: argparse.Namespace) -> 
 
 
 def main() -> None:
+    mp.freeze_support()
     args = parse_args()
     anchor = load_anchor_assembly(args.step_file)
     if args.interactive:
