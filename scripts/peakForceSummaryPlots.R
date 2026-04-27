@@ -30,6 +30,12 @@ get_script_dir = function() {
 
 source(file.path(get_script_dir(), "loadRaw.R"), chdir = TRUE)
 
+plot_font_family = "serif"
+if (.Platform$OS.type == "windows") {
+  windowsFonts(Times = windowsFont("Times New Roman"))
+  plot_font_family = "Times"
+}
+
 save_plots_as_png = FALSE
 project_root = normalizePath(file.path(get_script_dir(), ".."))
 plot_output_dir = file.path(project_root, "outputs", "plots")
@@ -83,7 +89,7 @@ if (save_plots_as_png) {
 
 old_par = par(no.readonly = TRUE)
 on.exit(par(old_par), add = TRUE)
-par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1), family = plot_font_family)
 
 for (beam_name in beam_levels) {
   beam_data = trial_summary[trial_summary$beam_dimension == beam_name, ]

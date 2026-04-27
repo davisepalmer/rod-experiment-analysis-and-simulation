@@ -1,3 +1,4 @@
+# Saves standard lm diagnostic plots for the final reduced regression model.
 get_script_dir = function() {
   cmd_args = commandArgs(trailingOnly = FALSE)
   file_arg = "--file="
@@ -29,6 +30,10 @@ get_script_dir = function() {
 
 source(file.path(get_script_dir(), "loadRaw.R"), chdir = TRUE)
 
+project_root = normalizePath(file.path(get_script_dir(), ".."))
+plot_output_dir = file.path(project_root, "outputs", "reducedModelDiagnostics")
+if (!dir.exists(plot_output_dir)) dir.create(plot_output_dir, recursive = TRUE)
+
 plot_font_family = "serif"
 if (.Platform$OS.type == "windows") {
   windowsFonts(Times = windowsFont("Times New Roman"))
@@ -45,8 +50,6 @@ normalize_shape_name = function(shape_name) {
   shape_lookup[[tolower(shape_name)]]
 }
 
-trial_names = names(all_trials)
-
 parse_trial_factors = function(trial_name) {
   prefix = sub("_T[0-9]+$", "", trial_name)
   moisture_condition = extract_condition_prefix(prefix)
@@ -62,12 +65,24 @@ parse_trial_factors = function(trial_name) {
   )
 }
 
+add_reduced_equation_columns = function(data) {
+  data$IB = as.integer(data$beam_dimension == "IBeam")
+  data$SQ = as.integer(data$beam_dimension == "Square")
+  data$M = data$soil_moisture_level
+  data$D = data$displacement_in
+  data$D2 = data$D^2
+  data$SQxM = data$SQ * data$M
+  data$IBxD = data$IB * data$D
+  data$SQxD = data$SQ * data$D
+  data$SQxD2 = data$SQ * data$D2
+  data$MxD = data$M * data$D
+  data$MxD2 = data$M * data$D2
+
+  data
+}
+
+trial_names = names(all_trials)
 trial_metadata = do.call(rbind, lapply(trial_names, parse_trial_factors))
-trial_metadata$moisture_condition = factor(
-  trial_metadata$moisture_condition,
-  levels = condition_prefix_levels,
-  labels = condition_display_labels[condition_prefix_levels]
-)
 trial_metadata$beam_dimension = factor(trial_metadata$beam_dimension, levels = c("Circle", "IBeam", "Square"))
 
 model_data = do.call(rbind, lapply(trial_names, function(trial_name) {
@@ -76,7 +91,6 @@ model_data = do.call(rbind, lapply(trial_names, function(trial_name) {
 
   data.frame(
     trial = trial_name,
-    moisture_condition = meta$moisture_condition,
     soil_moisture_level = meta$soil_moisture_level,
     beam_dimension = meta$beam_dimension,
     displacement_in = trial_df$`displacement[in]`,
@@ -85,68 +99,29 @@ model_data = do.call(rbind, lapply(trial_names, function(trial_name) {
   )
 }))
 
-model_data$trial = factor(model_data$trial)
-model_data$moisture_condition = factor(model_data$moisture_condition, levels = levels(trial_metadata$moisture_condition))
 model_data$beam_dimension = factor(model_data$beam_dimension, levels = levels(trial_metadata$beam_dimension))
-model_data$disp_c = model_data$displacement_in - mean(model_data$displacement_in, na.rm = TRUE)
-model_data$moist_c = model_data$soil_moisture_level - mean(model_data$soil_moisture_level, na.rm = TRUE)
-old_ask = par("ask")
-on.exit(par(ask = old_ask), add = TRUE)
-par(ask = TRUE, family = plot_font_family)
-###########################
-###########################
-###########################
-###########################
+model_data = add_reduced_equation_columns(model_data)
 
+reduced_eqn = force_lbf ~ IB + SQ + M + D + D2 + SQxM + IBxD + SQxD + SQxD2 + MxD + MxD2
+reduced_model = lm(reduced_eqn, data = model_data)
 
-# Edit this line freely.
-#eqn = force_lbf ~ beam_dimension + soil_moisture_level + displacement_in + I(displacement_in^2)
+plot_names = c(
+  "residuals_vs_fitted",
+  "normal_qq",
+  "scale_location",
+  "residuals_vs_leverage"
+)
 
-# Recommended balanced model: cubic displacement response with moisture and beam effects,
-# plus interaction terms that let curve shape vary by moisture and beam.
-eqn = force_lbf ~
-  beam_dimension +
-  soil_moisture_level +
-  displacement_in + I(displacement_in^2) + I(displacement_in^3) +
-  beam_dimension:soil_moisture_level +
-  displacement_in:beam_dimension +
-  I(displacement_in^2):beam_dimension +
-  displacement_in:soil_moisture_level +
-  I(displacement_in^2):soil_moisture_level
+for (i in seq_along(plot_names)) {
+  output_file = file.path(plot_output_dir, paste0(i, "_", plot_names[i], ".png"))
+  png(filename = output_file, width = 7, height = 5, units = "in", res = 300)
+  old_par = par(no.readonly = TRUE)
+  old_par$pin = NULL
+  par(family = plot_font_family)
+  plot(reduced_model, which = i)
+  par(old_par)
+  dev.off()
+}
 
-# Recommended if the Q-Q plot and residual diagnostics look poor.
-# eqn = log1p(force_lbf) ~
-#   beam_dimension +
-#   moist_c +
-#   disp_c + I(disp_c^2) + I(disp_c^3) +
-#   beam_dimension:moist_c +
-#   disp_c:beam_dimension +
-#   I(disp_c^2):beam_dimension +
-#   disp_c:moist_c +
-#   I(disp_c^2):moist_c
-
-
-model = lm(eqn, data = model_data)
-summary(model)
-
-plot(model)
-###########################
-###########################
-###########################
-###########################
-
-
-coefficient_table = summary(model)$coefficients
-anova_table = anova(model)
-
-print("Regression formula:")
-print(eqn)
-
-print("Model summary:")
-print(summary(model))
-
-print("Coefficient table:")
-print(coefficient_table)
-
-print("ANOVA table:")
-print(anova_table)
+cat("Saved reduced model diagnostic plots to:\n")
+cat(plot_output_dir, "\n", sep = "")

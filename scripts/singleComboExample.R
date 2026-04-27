@@ -30,6 +30,12 @@ get_script_dir = function() {
 
 source(file.path(get_script_dir(), "loadRaw.R"), chdir = TRUE)
 
+plot_font_family = "serif"
+if (.Platform$OS.type == "windows") {
+  windowsFonts(Times = windowsFont("Times New Roman"))
+  plot_font_family = "Times"
+}
+
 combo_prefix = "0uWaterCircle"
 poly_degree = 9
 save_plots_as_png = FALSE
@@ -82,6 +88,10 @@ if (save_plots_as_png) {
   png(filename = plot_output_file, width = 1200, height = 900, res = 150)
   on.exit(dev.off(), add = TRUE)
 }
+
+old_par = par(no.readonly = TRUE)
+on.exit(par(old_par), add = TRUE)
+par(family = plot_font_family)
 
 plot(
   combo_data$displacement_in,

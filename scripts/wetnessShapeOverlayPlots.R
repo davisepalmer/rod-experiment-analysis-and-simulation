@@ -30,6 +30,12 @@ get_script_dir = function() {
 
 source(file.path(get_script_dir(), "loadRaw.R"), chdir = TRUE)
 
+plot_font_family = "serif"
+if (.Platform$OS.type == "windows") {
+  windowsFonts(Times = windowsFont("Times New Roman"))
+  plot_font_family = "Times"
+}
+
 moisture_levels = condition_prefix_levels
 shape_levels = c("Circle", "Ibeam", "Square")
 shape_colors = c(Circle = "red", Ibeam = "blue", Square = "darkgreen")
@@ -85,7 +91,7 @@ if (save_plots_as_png) {
   on.exit(dev.off(), add = TRUE)
 }
 
-par(mfrow = c(2, 2), mar = c(4.5, 4.5, 3.5, 1.5))
+par(mfrow = c(2, 2), mar = c(4.5, 4.5, 3.5, 1.5), family = plot_font_family)
 
 for (moisture_prefix in moisture_levels) {
   moisture_label = condition_prefix_to_label(moisture_prefix)

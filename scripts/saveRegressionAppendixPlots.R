@@ -80,7 +80,9 @@ safe_filename = function(x) {
 }
 
 open_png_device = function(filename) {
-  if (capabilities("cairo")) {
+  if (.Platform$OS.type == "windows") {
+    png(filename = filename, width = 7, height = 5, units = "in", res = 300, type = "windows")
+  } else if (capabilities("cairo")) {
     png(filename = filename, width = 7, height = 5, units = "in", res = 300, type = "cairo")
   } else {
     png(filename = filename, width = 2100, height = 1500, res = 300)
@@ -88,7 +90,7 @@ open_png_device = function(filename) {
 }
 
 plot_font_family = "serif"
-if (.Platform$OS.type == "windows" && interactive()) {
+if (.Platform$OS.type == "windows") {
   windowsFonts(TimesNewRoman = windowsFont("Times New Roman"))
   plot_font_family = "TimesNewRoman"
 }

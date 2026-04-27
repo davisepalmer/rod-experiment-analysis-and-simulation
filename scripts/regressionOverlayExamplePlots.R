@@ -29,6 +29,12 @@ get_script_dir = function() {
 
 source(file.path(get_script_dir(), "loadRaw.R"), chdir = TRUE)
 
+plot_font_family = "serif"
+if (.Platform$OS.type == "windows") {
+  windowsFonts(Times = windowsFont("Times New Roman"))
+  plot_font_family = "Times"
+}
+
 normalize_shape_name = function(shape_name) {
   shape_lookup = c(
     circle = "Circle",
@@ -104,7 +110,7 @@ trial_palette = c("red", "blue", "darkgreen", "orange", "purple")
 
 old_par = par(no.readonly = TRUE)
 on.exit(par(old_par), add = TRUE)
-par(mfrow = c(1, length(example_conditions)), mar = c(4.5, 4.5, 3.5, 1.5))
+par(mfrow = c(1, length(example_conditions)), mar = c(4.5, 4.5, 3.5, 1.5), family = plot_font_family)
 
 for (condition_prefix in example_conditions) {
   condition_trial_names = names(all_trials)[grepl(paste0("^", condition_prefix, "_T[0-9]+$"), names(all_trials))]

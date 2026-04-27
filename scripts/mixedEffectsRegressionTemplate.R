@@ -52,6 +52,12 @@ if (!exists("%||%", mode = "function")) {
 
 source(file.path(get_script_dir(), "loadRaw.R"), chdir = TRUE)
 
+plot_font_family = "serif"
+if (.Platform$OS.type == "windows") {
+  windowsFonts(Times = windowsFont("Times New Roman"))
+  plot_font_family = "Times"
+}
+
 normalize_shape_name = function(shape_name) {
   shape_lookup = c(
     circle = "Circle",
@@ -158,7 +164,7 @@ model_residuals = resid(model)
 if (show_diagnostics) {
   old_par = par(no.readonly = TRUE)
   on.exit(par(old_par), add = TRUE)
-  par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+  par(mfrow = c(2, 2), mar = c(4, 4, 3, 1), family = plot_font_family)
   
   plot(
     model_fitted,
@@ -234,7 +240,7 @@ trial_colors = c("red", "blue", "darkgreen", "orange", "purple")
 
 old_par_overlay = par(no.readonly = TRUE)
 on.exit(par(old_par_overlay), add = TRUE)
-par(mfrow = c(length(shape_levels), length(condition_prefix_levels)), mar = c(4, 4, 3, 1))
+par(mfrow = c(length(shape_levels), length(condition_prefix_levels)), mar = c(4, 4, 3, 1), family = plot_font_family)
 
 for (shape_name in shape_levels) {
   for (condition_prefix in condition_prefix_levels) {

@@ -29,6 +29,12 @@ get_script_dir = function() {
 
 source(file.path(get_script_dir(), "loadRaw.R"), chdir = TRUE)
 
+plot_font_family = "serif"
+if (.Platform$OS.type == "windows") {
+  windowsFonts(Times = windowsFont("Times New Roman"))
+  plot_font_family = "Times"
+}
+
 trial_names = names(all_trials)
 
 normalize_shape_name = function(shape_name) {
@@ -134,7 +140,7 @@ beam_levels = levels(model_data$beam_dimension)
 trial_palette = c("red", "blue", "darkgreen", "orange", "purple")
 
 old_par = par(no.readonly = TRUE)
-par(mfrow = c(length(moisture_levels), length(beam_levels)), mar = c(4, 4, 3, 1))
+par(mfrow = c(length(moisture_levels), length(beam_levels)), mar = c(4, 4, 3, 1), family = plot_font_family)
 
 for (moisture_prefix in names(moisture_levels)) {
   moisture_label = condition_prefix_to_label(moisture_prefix)

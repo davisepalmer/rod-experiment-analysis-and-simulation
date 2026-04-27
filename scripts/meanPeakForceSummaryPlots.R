@@ -29,6 +29,12 @@ get_script_dir = function() {
 
 source(file.path(get_script_dir(), "loadRaw.R"), chdir = TRUE)
 
+plot_font_family = "serif"
+if (.Platform$OS.type == "windows") {
+  windowsFonts(Times = windowsFont("Times New Roman"))
+  plot_font_family = "Times"
+}
+
 normalize_shape_name = function(shape_name) {
   shape_lookup = c(
     circle = "Circle",
@@ -109,7 +115,7 @@ shape_mean = shape_mean[match(c("Circle", "IBeam", "Square"), shape_mean$group),
 shape_ylim = c(0, max(shape_mean$upper_ci, na.rm = TRUE) * 1.05)
 
 plot_mean_peak_force = function(summary_df, colors, plot_title, las = 1, cex.names = 1, ylim_override = NULL) {
-  par(mfrow = c(1, 1), mar = c(8, 5, 3, 1))
+  par(mfrow = c(1, 1), mar = c(8, 5, 3, 1), family = plot_font_family)
   ylim = if (is.null(ylim_override)) c(0, max(summary_df$upper_ci, na.rm = TRUE) * 1.05) else ylim_override
   bar_centers = barplot(
     height = summary_df$mean_peak_force,
@@ -157,3 +163,22 @@ for (i in seq_along(show_plots)) {
     )
   }
 }
+
+format_footer_means = function(summary_df, digits = 2) {
+  paste(
+    paste0(summary_df$group, ": ", formatC(summary_df$mean_peak_force, digits = digits, format = "f")),
+    collapse = "; "
+  )
+}
+
+cat("\nCOPY/PASTE FOOTER VALUES - MEAN PEAK FORCE LEFT TO RIGHT:\n")
+cat("Moisture chart: ", format_footer_means(moisture_mean, digits = 4), " [lbf].\n", sep = "")
+cat("Beam shape chart: ", format_footer_means(shape_mean, digits = 4), " [lbf].\n", sep = "")
+
+cat("\nCOPY/PASTE TABLE - MEAN PEAK FORCE:\n")
+footer_table = rbind(
+  data.frame(chart = "Moisture", group = moisture_mean$group, mean_peak_force_lbf = moisture_mean$mean_peak_force),
+  data.frame(chart = "Beam shape", group = shape_mean$group, mean_peak_force_lbf = shape_mean$mean_peak_force)
+)
+footer_table$mean_peak_force_lbf = formatC(footer_table$mean_peak_force_lbf, digits = 4, format = "f")
+write.table(footer_table, row.names = FALSE, quote = FALSE, sep = "\t")
