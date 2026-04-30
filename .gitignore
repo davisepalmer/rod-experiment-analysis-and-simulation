@@ -4,7 +4,7 @@
 /.Rproj.user/
 /data.Rproj
 
-# Local/generated helpers
+# Local helpers
 /presentation/
 /scripts/__pycache__/
 /scripts/*.ps1
@@ -21,10 +21,8 @@
 /00_*.pdf
 /MEEN*.pdf
 
-# Generated report extraction artifacts
+# Report extraction artifacts
 /outputs/appendix/
 /outputs/plots/reduced_equation_all_trials_overlay.png
 
-# Final submission deliverables are intentionally tracked
-!/final_submission/
-!/final_submission/**
+/final_submission
