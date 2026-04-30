@@ -1,7 +1,30 @@
+# R / RStudio local state
 /.RData
 /.Rhistory
-/.Rproj.user
+/.Rproj.user/
 /data.Rproj
-/presentation
-/scripts/__pycache__
+
+# Local/generated helpers
+/presentation/
+/scripts/__pycache__/
 /scripts/*.ps1
+/scripts/Rplots*.pdf
+
+# Report drafts, rubrics, and working notes kept out of commits
+/*.docx
+/docx_versions/
+/7. SP26 Report Format.pdf
+/8. SP26 Report Grading Sheet.pdf
+/draft_data_results_discussion.md
+/*.txt
+/Team 05*.pdf
+/00_*.pdf
+/MEEN*.pdf
+
+# Generated report extraction artifacts
+/outputs/appendix/
+/outputs/plots/reduced_equation_all_trials_overlay.png
+
+# Final submission deliverables are intentionally tracked
+!/final_submission/
+!/final_submission/**
